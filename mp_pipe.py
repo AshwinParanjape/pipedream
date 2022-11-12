@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-import functools
 import multiprocessing as mp
-from multiprocessing.queues import Queue
+from multiprocessing.queues import Queue, JoinableQueue
 import signal, os
 from typing import Iterator, Callable, Iterable
+from ctypes import c_bool, c_int
+
+from utils import print
 
 mp.set_start_method('fork')
 
-PoisonPill = "PoisonPill"
+
+class PoisonPill:
+    pass
+
+#= "PoisonPill"
 
 
 class PipeProcess(mp.Process):
-    def __init__(self, function: Callable[[Iterable], Iterable], output_buffer: Queue, input_buffer: Iterable = None, ):
+    def __init__(self, function: Callable[[Iterable], Iterable], output_buffer: Queue, input_buffer: Iterable = None, name='', *args, **kwargs):
         """
         Extends multiprocessing.Process; function operates over input_buffer and prpushes objects into the output buffer
 
@@ -24,11 +30,15 @@ class PipeProcess(mp.Process):
         self.function = function
         self.output_buffer = output_buffer
         self.input_buffer = input_buffer
+        self.args = args
+        self.kwargs = kwargs
+        self.name = name
 
     def start(self):
         # The process's parent is only recorded when it is actually started
-        super().__init__()
+        super().__init__(*self.args, **self.kwargs)
         signal.signal(signal.SIGPIPE, self.terminate_gracefully)
+        #print("Starting", self.name)
         super().start()
 
     def terminate_gracefully(self, *args):
@@ -40,14 +50,22 @@ class PipeProcess(mp.Process):
     def run(self):
         # self.function: iterator->iterator returns
         for item in self.function(self.input_buffer):
+            #print(f"{self.name}, {os.getpid()} putting item {item}")
             self.output_buffer.put(item)
+            #if isinstance(self.input_buffer, JoinableQueue):
+            #    self.input_buffer.task_done()
 
         # No more items, put PoisonPill so that downstream functions stop
-        self.output_buffer.put(PoisonPill)
-        self.output_buffer.close()
+        #print(f"{self.name} adding PoisonPill")
+        self.output_buffer.put(PoisonPill())
+        print("Producer process finished, waiting to join")
+        if isinstance(self.output_buffer, JoinableQueue):
+            self.output_buffer.join()
+        print("Producer process stopping")
+        #
 
 
-class Buffer(Queue):
+class BufferMixin():
     def __init__(self, producer_processes: Iterator[PipeProcess] = None, *args, **kwargs):
         """
         An iterable multiprocessing.Queue containing objects produced by the producer process.
@@ -60,32 +78,73 @@ class Buffer(Queue):
         ctx = mp.get_context('fork')
         super().__init__(*args, **kwargs, ctx=ctx)
         self.producer_processes = producer_processes
+        self.are_producers_created = mp.Value(c_bool, False)
+        self.process_creator_instance = False
+        self.producers_done = mp.Value(c_int, 0)
+        self.waiting_buffer_iterators = mp.Value(c_int, 0)
 
     def __iter__(self):
         # Create the producer process
-        for p in self.producer_processes:
-            p.start()
-        while True:
+        #print(len(self.producer_processes))
+        with self.are_producers_created.get_lock():
+            if not self.are_producers_created.value:
+                for p in self.producer_processes:
+                    p.start()
+                self.are_producers_created.value = True
+                self.process_creator_instance = True
+            else:
+                pass
+                #print("Producers already created")
 
+        with self.waiting_buffer_iterators.get_lock():
+            self.waiting_buffer_iterators.value += 1
+        while True:
             # Get the next element from self (buffer). This element
             # was pushed into the buffer by the producer process
             i = self.get()
-            if i != PoisonPill:
+            if type(i) != PoisonPill:
+                #print(f"yielding {i}")
                 yield i
             else:
-                # If PoisonPill was sent by the producer, producer is one
-                # exit iteration
-                break
+                # If PoisonPill was sent by the a producer, that producer is done
+                with self.producers_done.get_lock():
+                    self.producers_done.value += 1
+                    #print("Producers done", self.producers_done.value, [p.name for p in self.producer_processes])
+
+                    # If all producers are done, break
+                    if self.producers_done.value >= len(self.producer_processes):
+                        #print("breaking")
+                        # add the PoisonPill back so that the queue iterator can exit from other processes
+                        with self.waiting_buffer_iterators.get_lock():
+                            print(os.getpid(), "waiting buffers", self.waiting_buffer_iterators.value)
+                            self.waiting_buffer_iterators.value -= 1
+                            if self.waiting_buffer_iterators.value>0:
+                                self.put(i)
+                        #self.task_done()
+                        # exit iteration
+                        break
+                    else:
+                        pass
+                        #self.task_done()
+
+        print(os.getpid(), "Iterator finished, waiting to join")
+        self.join()
 
         # Send SIGPIPE to producer process. This triggers terminate_gracefully which
         # in turn kills all child processes spawned by self.process
-        for p in self.producer_processes:
-            os.kill(p.pid, signal.SIGPIPE)
+        if self.process_creator_instance:
+            for p in self.producer_processes:
+                print("killing", p.pid)
+                os.kill(p.pid, signal.SIGPIPE)
 
         # Wait till the current process has exited
-        for p in self.producer_processes:
-            p.join()
+        if self.process_creator_instance:
+            for p in self.producer_processes:
+                p.join()
         return
+
+class Buffer(BufferMixin, JoinableQueue):
+    pass
 
 class Pipeline:
     def __init__(self, instantiator, name: str):
@@ -119,7 +178,15 @@ class Pipeline:
     def __add__(self, other: Pipeline):
         return self.bypass(other)
 
+    def __mul__(self, n: int):
+        x = self
+        for i in range(n-1):
+            x = x.bypass(self)
+        return x
+
+
     def __iter__(self):
+        print("Pipeline iter called")
         return iter(self.instantiate())
 
 class PipeFunction(Pipeline):
@@ -132,7 +199,7 @@ class PipelineInstance:
     @classmethod
     def from_PipeFunction(cls, pipefunction: PipeFunction):
         tail_buffer = Buffer(maxsize=5)
-        head_processes = [PipeProcess(function=pipefunction.func, output_buffer=tail_buffer)]
+        head_processes = [PipeProcess(function=pipefunction.func, output_buffer=tail_buffer, name=pipefunction.name)]
         tail_buffer.producer_processes = head_processes
         return cls(head_processes, tail_buffer)
 
@@ -147,23 +214,36 @@ class PipelineInstance:
             hp.input_buffer = self._head_buffer
 
     def __init__(self, head_processes, tail_buffer):
+        #print(len(head_processes))
         self.head_processes = head_processes
         self.tail_buffer = tail_buffer
 
     # def __call__(self, input_buffer: Iterable, output_buffer: Buffer = None, output_buffer_maxsize=5):
-    def __call__(self, input_buffer: Iterable):
-        self.head_buffer = input_buffer
-        return self
+
 
     def chain(self, other: PipelineInstance):
         other.head_buffer = self.tail_buffer
         return PipelineInstance(self.head_processes, other.tail_buffer)
 
     def bypass(self, other: PipelineInstance):
-        return PipelineInstance(self.head_processes + other.head_processes, self.tail_buffer)
+        new_head_processes = self.head_processes + other.head_processes
+        for p in new_head_processes:
+            p.output_buffer = self.tail_buffer
+        self.tail_buffer.producer_processes = new_head_processes
+        other.tail_buffer = self.tail_buffer
+        return PipelineInstance(new_head_processes, self.tail_buffer)
+
+    def __call__(self, input_buffer: Iterable):
+        self.head_buffer = input_buffer
+        return self
 
     def __iter__(self):
-        return iter(self.tail_buffer)
+        print("PipelineInstance iter called")
+        for i in iter(self.tail_buffer):
+            print("PipelineInstance marking task done")
+            #self.tail_buffer.task_done()
+            yield i
+
 
 
 
